@@ -2,10 +2,11 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import plotly.express as px
+import yfinance as yf
 
 # --- PAGE CONFIGURATION ---
 st.set_page_config(
-    page_title="StockDetective | Dead Stock Analyzer",
+    page_title="StockDetective | Live Dead Stock Analyzer",
     page_icon="💀",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -16,44 +17,102 @@ st.markdown("""
     <style>
     .main-title { font-size: 2.2rem; font-weight: 700; color: #FF4B4B; margin-bottom: 0px; }
     .sub-title { font-size: 1.1rem; color: #A0A0A0; margin-bottom: 20px; }
-    .metric-card { background-color: #1E1E1E; padding: 15px; border-radius: 8px; border-left: 4px solid #FF4B4B; }
     </style>
 """, unsafe_allow_html=True)
 
 # --- HEADER ---
-st.markdown('<p class="main-title">💀 StockDetective: Dead Stock & Risk Analyzer</p>', unsafe_allow_html=True)
-st.markdown('<p class="sub-title">Screen, filter, and diagnose unviable, low-liquidity, and zombie stocks to protect your portfolio.</p>', unsafe_allow_html=True)
+st.markdown('<p class="main-title">💀 StockDetective: Live Dead Stock & Risk Analyzer</p>', unsafe_allow_html=True)
+st.markdown('<p class="sub-title">Screen real-time market data to diagnose unviable, low-liquidity, and zombie stocks.</p>', unsafe_allow_html=True)
 
 # --- SIDEBAR CONTROLS ---
-st.sidebar.header("🔍 Screening Parameters")
+st.sidebar.header("🔍 Live Ticker Configuration")
 
-data_source = st.sidebar.radio("Select Data Source", ["Sample Dataset", "Custom CSV Upload"])
+# Default stock universe (Mix of global tech and Indian NSE stocks)
+default_tickers = [
+    "AAPL", "MSFT", "GOOGL", "TSLA", "AMZN", 
+    "RELIANCE.NS", "TCS.NS", "INFY.NS", "ZOMATO.NS", "VODAFONE.NS"
+]
 
-@st.cache_data
-def load_sample_data():
-    return pd.read_csv("sample_stocks.csv")
+selected_tickers = st.sidebar.multiselect(
+    "Select or Add Stock Tickers",
+    options=default_tickers,
+    default=default_tickers[:6]
+)
 
-if data_source == "Sample Dataset":
-    df = load_sample_data()
-    st.sidebar.success("Loaded built-in sample stock dataset.")
-else:
-    uploaded_file = st.sidebar.file_uploader("Upload Stock CSV File", type=["csv"])
-    if uploaded_file is not None:
-        df = pd.read_csv(uploaded_file)
-    else:
-        st.info("Please upload a CSV file or switch to the Sample Dataset.")
-        df = load_sample_data()
+custom_ticker_input = st.sidebar.text_input("Add Custom Ticker (e.g., NVDA, TATAMOTORS.NS)")
+if custom_ticker_input:
+    clean_ticker = custom_ticker_input.strip().upper()
+    if clean_ticker not in selected_tickers:
+        selected_tickers.append(clean_ticker)
 
 st.sidebar.markdown("---")
-st.sidebar.subheader("Dead Stock Thresholds")
-min_volume = st.sidebar.slider("Min Daily Trading Volume", 5000, 100000, 20000, step=5000)
-max_return = st.sidebar.slider("Max 1-Year Price Change (%)", -80.0, 10.0, -15.0, step=5.0)
+st.sidebar.subheader("Dead Stock Risk Thresholds")
+min_volume = st.sidebar.slider("Min Daily Trading Volume", 10000, 1000000, 100000, step=50000)
+max_return = st.sidebar.slider("Max 1-Year Price Change (%)", -80.0, 10.0, -10.0, step=5.0)
 max_de = st.sidebar.slider("Max Debt-to-Equity Ratio", 0.5, 10.0, 3.0, step=0.5)
 
-# --- DATA PROCESSING & RISK SCORING ---
+# --- REAL-TIME DATA FETCHING WITH CACHING ---
+@st.cache_data(ttl=3600)  # Cache data for 1 hour to prevent hitting rate limits
+def fetch_live_stock_data(tickers):
+    stock_records = []
+    
+    for symbol in tickers:
+        try:
+            ticker_obj = yfinance_wrapper(symbol) # helper logic
+            stock = yf.Ticker(symbol)
+            info = stock.info
+            
+            # Fetch 1 year historical data for price performance
+            hist = stock.history(period="1y")
+            
+            if hist.empty:
+                continue
+                
+            start_price = hist['Close'].iloc[0]
+            end_price = hist['Close'].iloc[-1]
+            price_change_1y = ((end_price - start_price) / start_price) * 100
+            
+            # Extract basic fundamental attributes safely
+            company_name = info.get('shortName', symbol)
+            sector = info.get('sector', 'Unknown')
+            avg_volume = info.get('averageVolume', hist['Volume'].mean())
+            debt_to_equity = info.get('debtToEquity', 1.5) / 100.0 if info.get('debtToEquity') else 1.0
+            roe = info.get('returnOnEquity', 0.1) * 100 if info.get('returnOnEquity') else 5.0
+            eps = info.get('trailingEps', 0.0)
+            
+            stock_records.append({
+                'Ticker': symbol,
+                'CompanyName': company_name,
+                'Sector': sector,
+                'Daily_Volume': int(avg_volume if not pd.isna(avg_volume) else 100000),
+                'Price_Change_1Y_Pct': round(price_change_1y, 2),
+                'Debt_to_Equity': round(float(debt_to_equity), 2),
+                'ROE_Pct': round(float(roe), 2),
+                'EPS': round(float(eps if eps else 0.0), 2)
+            })
+        except Exception as e:
+            # Skip invalid tickers gracefully
+            continue
+            
+    return pd.DataFrame(stock_records)
+
+def yfinance_wrapper(sym):
+    return sym
+
+# Load data when user initiates
+if not selected_tickers:
+    st.warning("Please select at least one stock ticker from the sidebar.")
+    st.stop()
+
+with st.spinner("Fetching live market data from Yahoo Finance... ⏳"):
+    df = fetch_live_stock_data(selected_tickers)
+
+if df.empty:
+    st.error("Could not fetch data for the selected tickers. Please verify symbol names (e.g., NSE stocks require '.NS' suffix).")
+    st.stop()
+
+# --- EVALUATION & RISK SCORING ENGINE ---
 def evaluate_dead_stocks(data, vol_thresh, ret_thresh, de_thresh):
-    # Calculate custom Dead Stock Risk Score (0-100)
-    # Higher score = higher probability of being a dead/uninvestable stock
     conditions = []
     for _, row in data.iterrows():
         score = 0
@@ -90,8 +149,8 @@ def evaluate_dead_stocks(data, vol_thresh, ret_thresh, de_thresh):
 
 processed_df = evaluate_dead_stocks(df, min_volume, max_return, max_de)
 
-# --- MAIN DASHBOARD TABS ---
-tab1, tab2, tab3 = st.tabs(["📊 Overview & Screening", "💀 Dead Stock Deep Dive", "⚙️ Data Quality & Audit"])
+# --- DASHBOARD LAYOUT ---
+tab1, tab2, tab3 = st.tabs(["📊 Live Screener Overview", "💀 Risk Heatmap", "⚙️ Raw Data & Diagnostics"])
 
 with tab1:
     col1, col2, col3, col4 = st.columns(4)
@@ -100,16 +159,15 @@ with tab1:
     stagnant_count = len(processed_df[processed_df['Classification'].str.contains("Stagnant")])
     healthy_count = len(processed_df[processed_df['Classification'].str.contains("Healthy")])
     
-    col1.metric("Total Analyzed", total_stocks)
-    col2.metric("💀 Dead Stocks", dead_count, delta_color="inverse")
+    col1.metric("Analyzed Tickers", total_stocks)
+    col2.metric("💀 Dead Stocks", dead_count)
     col3.metric("⚠️ Stagnant Stocks", stagnant_count)
     col4.metric("✅ Healthy Stocks", healthy_count)
     
-    st.markdown("### 📋 Filtered Stock Universe")
+    st.markdown("### 📋 Filtered Market Results")
     
-    # Filter selection
     status_filter = st.multiselect(
-        "Filter by Classification",
+        "Filter by Status",
         options=["💀 Dead Stock (Avoid)", "⚠️ Stagnant / Watch", "✅ Healthy"],
         default=["💀 Dead Stock (Avoid)", "⚠️ Stagnant / Watch", "✅ Healthy"]
     )
@@ -117,18 +175,16 @@ with tab1:
     filtered_view = processed_df[processed_df['Classification'].isin(status_filter)]
     st.dataframe(filtered_view, use_container_width=True)
     
-    # Download button
     csv_data = filtered_view.to_csv(index=False).encode('utf-8')
     st.download_button(
-        label="📥 Download Screening Report (CSV)",
+        label="📥 Download Live Screening Report (CSV)",
         data=csv_data,
-        file_name="dead_stock_screening_report.csv",
+        file_name="live_dead_stock_report.csv",
         mime="text/csv"
     )
 
 with tab2:
-    st.markdown("### 🔬 Dead Stock Risk Visualizer")
-    
+    st.markdown("### 🔬 Risk Matrix: Volume vs. 1-Year Price Return")
     if not processed_df.empty:
         fig = px.scatter(
             processed_df,
@@ -138,30 +194,14 @@ with tab2:
             color="Classification",
             hover_name="Ticker",
             text="CompanyName",
-            title="Trading Volume vs. 1-Year Price Return (Risk Heatmap)",
-            labels={"Daily_Volume": "Daily Trading Volume", "Price_Change_1Y_Pct": "1-Year Price Change (%)"}
+            title="Live Market Position vs Risk Score",
+            labels={"Daily_Volume": "Average Daily Volume", "Price_Change_1Y_Pct": "1-Year Price Change (%)"}
         )
         fig.update_traces(textposition='top center')
         fig.update_layout(height=550)
         st.plotly_chart(fig, use_container_width=True)
-    else:
-        st.warning("No data available to display visualizations.")
 
 with tab3:
-    st.markdown("### 🛠️ Dataset Data Quality Checks")
-    st.markdown("Ensuring data integrity before running investment heuristics.")
-    
-    null_counts = processed_df.isnull().sum().sum()
-    duplicate_rows = processed_df.duplicated().sum()
-    
-    col_a, col_b = st.columns(2)
-    col_a.metric("Missing Values Detected", null_counts)
-    col_b.metric("Duplicate Records", duplicate_rows)
-    
-    if null_counts == 0 and duplicate_rows == 0:
-        st.success("Data Quality Status: **PASSED** ✅. No missing or duplicate fields found in the dataset.")
-    else:
-        st.warning("Data Quality Status: **WARNING** ⚠️. Anomalies detected in source data.")
-        
-    st.markdown("#### Raw Schema Inspection")
-    st.write(processed_df.dtypes)
+    st.markdown("### 🛠️ Execution Diagnostics")
+    st.write("Fetched live metrics successfully from Yahoo Finance API.")
+    st.write(processed_df.describe())
